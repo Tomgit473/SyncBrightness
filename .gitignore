@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 build/
 dist/
+release/
 src/build/
 src/dist/
 *.spec
