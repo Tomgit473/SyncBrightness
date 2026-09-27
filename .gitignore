@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+build/
+dist/
+src/build/
+src/dist/
+*.spec
+*.zip
+*.lnk
+
+# Windows / editor cruft
+Thumbs.db
+Desktop.ini
+*.log
+.vscode/
+.idea/
+
+# Privacy & Secrets
+.env
+.env.*
+*.pem
+*.key
+*.token
+credentials*
+secrets*
+config.json
+

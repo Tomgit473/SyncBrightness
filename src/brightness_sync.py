@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -41,10 +42,10 @@ MONITOR_FAILURE_DISABLE_COUNT = 3
 MONITOR_FAILURE_COOLDOWN_SECONDS = 60.0
 MONITOR_REFRESH_SECONDS = 30.0
 MONITOR_RETRY_SECONDS = 5.0
-PREFERRED_MONITOR_MODEL = "S2240L"
-PREFERRED_MONITOR_VENDOR = "DELL"
 ERROR_ALREADY_EXISTS = 183
 MUTEX_NAME = r"Local\BrightnessSyncSingleton"
+HOTKEY_TOGGLE = 1
+HOTKEY_QUIT = 2
 
 
 @dataclass
@@ -64,6 +65,11 @@ class AppConfig:
     manual_brightness: int = 65
     manual_contrast: int = 70
     first_run_notice_shown: bool = False
+    preferred_monitor_model: str = ""
+    preferred_monitor_vendor: str = ""
+    hotkey_start: str = "ctrl+alt+s"
+    hotkey_toggle: str = "ctrl+alt+b"
+    hotkey_quit: str = "ctrl+alt+q"
 
 
 DEFAULT_CONFIG = AppConfig()
@@ -113,6 +119,139 @@ class SingleInstanceGuard:
             self.handle = None
 
 
+class HotkeyManager:
+    """Register global hotkeys using Win32 RegisterHotKey API."""
+
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_NOREPEAT = 0x4000
+    WM_HOTKEY = 0x0312
+
+    _VK_MAP: dict[str, int] = {}
+
+    @classmethod
+    def _init_vk_map(cls) -> None:
+        if cls._VK_MAP:
+            return
+        # Letters A-Z
+        for c in range(ord("A"), ord("Z") + 1):
+            cls._VK_MAP[chr(c).lower()] = c
+        # Digits 0-9
+        for d in range(10):
+            cls._VK_MAP[str(d)] = 0x30 + d
+        # F-keys
+        for f in range(1, 25):
+            cls._VK_MAP[f"f{f}"] = 0x6F + f
+        # Common keys
+        cls._VK_MAP.update({
+            "space": 0x20, "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
+            "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
+            "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+            "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+            "printscreen": 0x2C, "pause": 0x13, "numlock": 0x90, "scrolllock": 0x91,
+        })
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+        self._callbacks: dict[int, tuple[str, callable]] = {}
+        self._thread: Optional[threading.Thread] = None
+        self._thread_id: Optional[int] = None
+        self._registered_ids: list[int] = []
+        self._ready = threading.Event()
+        self._init_vk_map()
+
+    @staticmethod
+    def _parse_hotkey(hotkey_str: str) -> tuple[int, int]:
+        """Parse a hotkey string like 'ctrl+alt+b' into (modifiers, vk_code)."""
+        HotkeyManager._init_vk_map()
+        parts = [p.strip().lower() for p in hotkey_str.split("+")]
+        modifiers = HotkeyManager.MOD_NOREPEAT
+        vk_code = 0
+
+        for part in parts:
+            if part in ("ctrl", "control"):
+                modifiers |= HotkeyManager.MOD_CONTROL
+            elif part in ("alt", "menu"):
+                modifiers |= HotkeyManager.MOD_ALT
+            elif part in ("shift",):
+                modifiers |= HotkeyManager.MOD_SHIFT
+            elif part in HotkeyManager._VK_MAP:
+                vk_code = HotkeyManager._VK_MAP[part]
+            else:
+                raise ValueError(f"Unknown key in hotkey string: '{part}'")
+
+        if vk_code == 0:
+            raise ValueError(f"No key specified in hotkey string: '{hotkey_str}'")
+
+        return modifiers, vk_code
+
+    def register(self, hotkey_id: int, hotkey_str: str, callback: callable) -> None:
+        """Queue a hotkey for registration. Call start() after all registrations."""
+        self._callbacks[hotkey_id] = (hotkey_str, callback)
+
+    def start(self) -> None:
+        """Start the hotkey listener thread."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._message_loop, name="hotkey-listener", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=5)
+
+    def stop(self) -> None:
+        """Unregister all hotkeys and stop the listener."""
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._thread = None
+        self._thread_id = None
+
+    def _message_loop(self) -> None:
+        """Win32 thread message pump for hotkey events (runs on daemon thread)."""
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+
+        # Force creation of message queue for this thread
+        msg = ctypes.wintypes.MSG()
+        ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+
+        # Register hotkeys to this thread (hWnd = None)
+        for hotkey_id, (hotkey_str, _) in self._callbacks.items():
+            try:
+                modifiers, vk_code = self._parse_hotkey(hotkey_str)
+                result = ctypes.windll.user32.RegisterHotKey(None, hotkey_id, modifiers, vk_code)
+                if result:
+                    self._registered_ids.append(hotkey_id)
+                    self.logger.info("Registered global hotkey: %s (id=%d)", hotkey_str, hotkey_id)
+                else:
+                    self.logger.warning(
+                        "Failed to register hotkey '%s' — it may be in use by another app.", hotkey_str,
+                    )
+            except ValueError as exc:
+                self.logger.warning("Invalid hotkey config '%s': %s", hotkey_str, exc)
+
+        self._ready.set()
+
+        # Message pump
+        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == self.WM_HOTKEY:
+                hotkey_id = int(msg.wParam)
+                entry = self._callbacks.get(hotkey_id)
+                if entry:
+                    _, callback = entry
+                    try:
+                        callback()
+                    except Exception:
+                        self.logger.exception("Error in hotkey callback for id=%d", hotkey_id)
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+
+        # Cleanup
+        for hid in self._registered_ids:
+            ctypes.windll.user32.UnregisterHotKey(None, hid)
+        self._registered_ids.clear()
+
+
 class ConfigStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -122,7 +261,7 @@ class ConfigStore:
             return AppConfig()
 
         try:
-            with self.path.open("r", encoding="utf-8") as file:
+            with self.path.open("r", encoding="utf-8-sig") as file:
                 raw = json.load(file)
             return AppConfig(
                 enabled=bool(raw.get("enabled", DEFAULT_CONFIG.enabled)),
@@ -140,6 +279,11 @@ class ConfigStore:
                 manual_brightness=int(raw.get("manual_brightness", DEFAULT_CONFIG.manual_brightness)),
                 manual_contrast=int(raw.get("manual_contrast", DEFAULT_CONFIG.manual_contrast)),
                 first_run_notice_shown=bool(raw.get("first_run_notice_shown", DEFAULT_CONFIG.first_run_notice_shown)),
+                preferred_monitor_model=str(raw.get("preferred_monitor_model", DEFAULT_CONFIG.preferred_monitor_model)),
+                preferred_monitor_vendor=str(raw.get("preferred_monitor_vendor", DEFAULT_CONFIG.preferred_monitor_vendor)),
+                hotkey_start=str(raw.get("hotkey_start", DEFAULT_CONFIG.hotkey_start)),
+                hotkey_toggle=str(raw.get("hotkey_toggle", DEFAULT_CONFIG.hotkey_toggle)),
+                hotkey_quit=str(raw.get("hotkey_quit", DEFAULT_CONFIG.hotkey_quit)),
             )
         except Exception:
             logging.getLogger(APP_NAME).exception("Failed to read config file, using defaults.")
@@ -191,6 +335,34 @@ class StartupManager:
         interpreter = pythonw_exe if pythonw_exe.exists() else python_exe
         script_path = Path(__file__).resolve()
         return f'"{interpreter}" "{script_path}"'
+
+    def create_or_update_shortcut(self, hotkey: str = "ctrl+alt+s") -> None:
+        """Create or update Windows Start Menu shortcut with a hotkey to start the app."""
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("WScript.Shell")
+            programs = Path(shell.SpecialFolders("Programs"))
+            lnk_path = programs / f"{APP_NAME}.lnk"
+
+            python_exe = Path(sys.executable).resolve()
+            pythonw_exe = python_exe.with_name("pythonw.exe")
+            interpreter = pythonw_exe if pythonw_exe.exists() else python_exe
+            script_path = Path(__file__).resolve()
+
+            shortcut = shell.CreateShortCut(str(lnk_path))
+            shortcut.TargetPath = str(interpreter)
+            shortcut.Arguments = f'"{script_path}"'
+            shortcut.WorkingDirectory = str(script_path.parent.parent)
+
+            if hotkey:
+                parts = [p.strip().capitalize() for p in hotkey.split("+")]
+                shortcut.Hotkey = "+".join(parts)
+
+            shortcut.Description = f"{APP_NAME} (Universal Brightness Sync)"
+            shortcut.Save()
+            self.logger.info("Created/updated Start Menu shortcut with hotkey '%s': %s", shortcut.Hotkey, lnk_path)
+        except Exception:
+            self.logger.exception("Failed to create Start Menu shortcut.")
 
 
 class LaptopBrightnessReader:
@@ -278,8 +450,10 @@ class LaptopBrightnessReader:
 
 
 class ExternalMonitorManager:
-    def __init__(self, logger: logging.Logger) -> None:
+    def __init__(self, logger: logging.Logger, preferred_model: str = "", preferred_vendor: str = "") -> None:
         self.logger = logger
+        self.preferred_model = preferred_model
+        self.preferred_vendor = preferred_vendor
         self.detected: list[DetectedMonitor] = []
         self.selected: list[DetectedMonitor] = []
         self.last_signature = ""
@@ -372,13 +546,17 @@ class ExternalMonitorManager:
         return monitors
 
     def _is_preferred(self, description: str, model: str, input_source: str) -> bool:
+        # Universal mode: when no preference is configured, treat all monitors equally.
+        if not self.preferred_model and not self.preferred_vendor:
+            return False
         combined = f"{description} {model}".upper()
-        has_model = PREFERRED_MONITOR_MODEL.upper() in combined
-        has_vendor = PREFERRED_MONITOR_VENDOR.upper() in combined
-        is_hdmi = input_source.upper().startswith("HDMI")
+        has_model = self.preferred_model and self.preferred_model.upper() in combined
+        has_vendor = self.preferred_vendor and self.preferred_vendor.upper() in combined
         if has_model:
             return True
-        return not model and has_vendor and is_hdmi
+        if has_vendor:
+            return True
+        return False
 
     def _format_input_source(self, input_code: int) -> str:
         try:
@@ -415,7 +593,11 @@ class BrightnessSyncApp:
         self.config = self.config_store.load()
         self.config_store.save(self.config)
         self.startup_manager = StartupManager(self.logger)
-        self.monitor_manager = ExternalMonitorManager(self.logger)
+        self.monitor_manager = ExternalMonitorManager(
+            self.logger,
+            preferred_model=self.config.preferred_monitor_model,
+            preferred_vendor=self.config.preferred_monitor_vendor,
+        )
         self.stop_event = threading.Event()
         self.worker = threading.Thread(target=self._worker_loop, name="brightness-sync-worker", daemon=True)
         self.state_lock = threading.Lock()
@@ -438,12 +620,23 @@ class BrightnessSyncApp:
     def run(self) -> None:
         self.logger.info("Starting %s.", APP_NAME)
         self.startup_manager.set_enabled(self.config.start_with_windows)
+        self.startup_manager.create_or_update_shortcut(self.config.hotkey_start)
         self._maybe_show_first_run_notice()
+
+        # Register global hotkeys.
+        self.hotkey_manager = HotkeyManager(self.logger)
+        if self.config.hotkey_toggle:
+            self.hotkey_manager.register(HOTKEY_TOGGLE, self.config.hotkey_toggle, self.toggle_sync)
+        if self.config.hotkey_quit:
+            self.hotkey_manager.register(HOTKEY_QUIT, self.config.hotkey_quit, self.quit_app)
+        self.hotkey_manager.start()
 
         self.worker.start()
         self.icon.run()
 
     def shutdown(self) -> None:
+        if hasattr(self, "hotkey_manager"):
+            self.hotkey_manager.stop()
         self.stop_event.set()
         if self.worker.is_alive():
             self.worker.join(timeout=5)
@@ -463,7 +656,7 @@ class BrightnessSyncApp:
                 self.applied_monitor_levels.clear()
 
         state = "enabled" if self.config.enabled else "disabled"
-        self.logger.info("Synchronization %s from the tray menu.", state)
+        self.logger.info("Synchronization %s.", state)
         self._refresh_tray_menu()
 
     def restore_safe_defaults(
@@ -521,6 +714,8 @@ class BrightnessSyncApp:
             self.control_window.close()
         if icon is not None:
             icon.stop()
+        elif hasattr(self, "icon") and self.icon is not None:
+            self.icon.stop()
 
     def set_manual_mode(self, enabled: bool) -> None:
         with self.state_lock:
@@ -583,6 +778,9 @@ class BrightnessSyncApp:
         if self.config.first_run_notice_shown:
             return
 
+        self.config.first_run_notice_shown = True
+        self.config_store.save(self.config)
+
         message = (
             "Brightness Sync changes external monitor brightness using standard DDC/CI controls.\n\n"
             "Safe defaults are enabled for first use:\n"
@@ -591,13 +789,13 @@ class BrightnessSyncApp:
             "- Unsupported monitors are skipped automatically\n\n"
             "Use only on monitors with DDC/CI enabled."
         )
-        try:
-            ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x40)
-        except Exception:
-            self.logger.warning("Unable to show first-run safety notice.")
+        def show_box() -> None:
+            try:
+                ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x40)
+            except Exception:
+                self.logger.warning("Unable to show first-run safety notice.")
 
-        self.config.first_run_notice_shown = True
-        self.config_store.save(self.config)
+        threading.Thread(target=show_box, name="first-run-notice", daemon=True).start()
 
     def _worker_loop(self) -> None:
         pythoncom.CoInitialize()
@@ -940,9 +1138,19 @@ class BrightnessSyncApp:
         return target_value
 
     def _build_menu(self) -> pystray.Menu:
+        toggle_label = (
+            f"Enable synchronization ({self.config.hotkey_toggle.upper()})"
+            if self.config.hotkey_toggle
+            else "Enable synchronization"
+        )
+        quit_label = (
+            f"Quit ({self.config.hotkey_quit.upper()})"
+            if self.config.hotkey_quit
+            else "Quit"
+        )
         return pystray.Menu(
             pystray.MenuItem(
-                "Enable synchronization",
+                toggle_label,
                 self.toggle_sync,
                 checked=lambda item: self.config.enabled,
             ),
@@ -959,7 +1167,7 @@ class BrightnessSyncApp:
                 checked=lambda item: self.config.start_with_windows,
             ),
             pystray.MenuItem("Open log folder", self.open_log_folder),
-            pystray.MenuItem("Quit", self.quit_app),
+            pystray.MenuItem(quit_label, self.quit_app),
         )
 
     def _refresh_tray_menu(self) -> None:

@@ -29,13 +29,16 @@ else {
 $defaults = @{
     enabled = $true
     start_with_windows = $true
-    monitor_brightness_min = 0
-    monitor_brightness_max = 100
-    monitor_brightness_gamma = 1.15
+    monitor_brightness_min = 10
+    monitor_brightness_max = 90
+    monitor_brightness_gamma = 1.1
+    manage_contrast = $false
     sync_contrast_to_brightness = $false
-    monitor_contrast = 75
+    monitor_contrast = 70
     smooth_transitions = $true
     smooth_step = 4
+    smooth_jump_threshold = 15
+    first_run_notice_shown = $false
 }
 
 foreach ($entry in $defaults.GetEnumerator()) {
@@ -67,4 +70,5 @@ Write-Host "Config file:"
 Write-Host "  $configPath"
 Write-Host ""
 Write-Host "The app has been restarted and registered in Windows startup."
+
 

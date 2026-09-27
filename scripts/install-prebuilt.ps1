@@ -1,25 +1,49 @@
 ﻿param(
-    [switch]$SkipBuild
+    [string]$ExePath
 )
 
 $ErrorActionPreference = "Stop"
 
-$projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$buildScript = Join-Path $PSScriptRoot "build.ps1"
-$distExe = Join-Path $projectRoot "dist\BrightnessSync.exe"
+function New-AppShortcut {
+    param(
+        [string]$ShortcutPath,
+        [string]$TargetPath,
+        [string]$WorkingDirectory,
+        [string]$Description
+    )
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($ShortcutPath)
+    $shortcut.TargetPath = $TargetPath
+    $shortcut.WorkingDirectory = $WorkingDirectory
+    $shortcut.IconLocation = $TargetPath
+    $shortcut.Description = $Description
+    $shortcut.Save()
+}
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $ExePath) {
+    $ExePath = Join-Path $scriptDir "BrightnessSync.exe"
+}
+
+$resolvedExe = Resolve-Path -LiteralPath $ExePath -ErrorAction SilentlyContinue
+if (-not $resolvedExe) {
+    throw "BrightnessSync.exe was not found. Keep this script next to the packaged executable."
+}
+$resolvedExe = $resolvedExe.Path
+
 $installDir = Join-Path $env:LOCALAPPDATA "BrightnessSync"
 $installedExe = Join-Path $installDir "BrightnessSync.exe"
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $runValueName = "BrightnessSync"
 $configDir = Join-Path $env:APPDATA "BrightnessSync"
 $configPath = Join-Path $configDir "config.json"
-
-if (-not $SkipBuild -or -not (Test-Path $distExe)) {
-    & $buildScript
-}
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) "Brightness Sync.lnk"
+$startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+$startMenuShortcut = Join-Path $startMenuDir "Brightness Sync.lnk"
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-Copy-Item -LiteralPath $distExe -Destination $installedExe -Force
+Copy-Item -LiteralPath $resolvedExe -Destination $installedExe -Force
 
 New-Item -Path $runKey -Force | Out-Null
 New-ItemProperty -Path $runKey -Name $runValueName -Value "`"$installedExe`"" -PropertyType String -Force | Out-Null
@@ -66,15 +90,19 @@ Get-CimInstance Win32_Process | Where-Object {
     }
 }
 
+New-AppShortcut -ShortcutPath $desktopShortcut -TargetPath $installedExe -WorkingDirectory $installDir -Description "Brightness Sync"
+New-AppShortcut -ShortcutPath $startMenuShortcut -TargetPath $installedExe -WorkingDirectory $installDir -Description "Brightness Sync"
+
 Start-Sleep -Seconds 1
 Start-Process -FilePath $installedExe -WindowStyle Hidden
 
 Write-Host ""
-Write-Host "Installed BrightnessSync to:"
+Write-Host "Brightness Sync is installed."
+Write-Host "Installed to:"
 Write-Host "  $installedExe"
-Write-Host "Config file:"
-Write-Host "  $configPath"
+Write-Host "Desktop shortcut:"
+Write-Host "  $desktopShortcut"
+Write-Host "Start menu shortcut:"
+Write-Host "  $startMenuShortcut"
 Write-Host ""
-Write-Host "The app has been started and registered in Windows startup."
-
-
+Write-Host "The app is now running and will start with Windows."
