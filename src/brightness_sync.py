@@ -337,32 +337,53 @@ class StartupManager:
         return f'"{interpreter}" "{script_path}"'
 
     def create_or_update_shortcut(self, hotkey: str = "ctrl+alt+s") -> None:
-        """Create or update Windows Start Menu shortcut with a hotkey to start the app."""
+        """Create or update Desktop and Start Menu shortcuts with a hotkey to start the app."""
         try:
             import win32com.client
             shell = win32com.client.Dispatch("WScript.Shell")
-            programs = Path(shell.SpecialFolders("Programs"))
-            lnk_path = programs / f"{APP_NAME}.lnk"
+            targets: list[Path] = []
+            for folder_name in ("Programs", "Desktop"):
+                try:
+                    f = Path(shell.SpecialFolders(folder_name))
+                    if f.exists():
+                        targets.append(f / f"{APP_NAME}.lnk")
+                except Exception:
+                    pass
 
-            python_exe = Path(sys.executable).resolve()
-            pythonw_exe = python_exe.with_name("pythonw.exe")
-            interpreter = pythonw_exe if pythonw_exe.exists() else python_exe
-            script_path = Path(__file__).resolve()
+            if getattr(sys, "frozen", False):
+                target_exe = Path(sys.executable).resolve()
+                arguments = ""
+                working_dir = target_exe.parent
+            else:
+                python_exe = Path(sys.executable).resolve()
+                pythonw_exe = python_exe.with_name("pythonw.exe")
+                target_exe = pythonw_exe if pythonw_exe.exists() else python_exe
+                script_path = Path(__file__).resolve()
+                arguments = f'"{script_path}"'
+                working_dir = script_path.parent.parent
 
-            shortcut = shell.CreateShortCut(str(lnk_path))
-            shortcut.TargetPath = str(interpreter)
-            shortcut.Arguments = f'"{script_path}"'
-            shortcut.WorkingDirectory = str(script_path.parent.parent)
-
+            formatted_hotkey = ""
             if hotkey:
                 parts = [p.strip().capitalize() for p in hotkey.split("+")]
-                shortcut.Hotkey = "+".join(parts)
+                formatted_hotkey = "+".join(parts)
 
-            shortcut.Description = f"{APP_NAME} (Universal Brightness Sync)"
-            shortcut.Save()
-            self.logger.info("Created/updated Start Menu shortcut with hotkey '%s': %s", shortcut.Hotkey, lnk_path)
+            for lnk_path in targets:
+                shortcut = shell.CreateShortCut(str(lnk_path))
+                shortcut.TargetPath = str(target_exe)
+                shortcut.Arguments = arguments
+                shortcut.WorkingDirectory = str(working_dir)
+                if formatted_hotkey:
+                    shortcut.Hotkey = formatted_hotkey
+                shortcut.Description = f"{APP_NAME} (Universal Brightness Sync)"
+                shortcut.Save()
+                self.logger.info("Created/updated shortcut with hotkey '%s': %s", shortcut.Hotkey, lnk_path)
+
+            try:
+                ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+            except Exception:
+                pass
         except Exception:
-            self.logger.exception("Failed to create Start Menu shortcut.")
+            self.logger.exception("Failed to create shortcut.")
 
 
 class LaptopBrightnessReader:
